@@ -312,10 +312,11 @@ def text_to_macro_lines(text, base_ms, humanize=False, total_ms=None, error_rate
     return lines
 
 
-def macro(file, stop_event, stats=None, pause_event=None):
+def macro(file, stop_event, stats=None, pause_event=None, controller=None):
     if not file:
         return
-    controller = kb_module.Controller()
+    if controller is None:
+        controller = kb_module.Controller()
     held_keys = []
     if stats is not None:
         stats['letter_times'] = []
@@ -436,6 +437,8 @@ def build_run_tab(tab, app, anim):
     stats_dict       = {}
     macro_total_ms   = [0]
     macro_wall_start = [0.0]
+    pause_wall_start = [0.0]
+    paused_total_s   = [0.0]
 
     # ── Pulse animation ───────────────────────────────────────────────────────
     def pulse_step():
@@ -452,7 +455,9 @@ def build_run_tab(tab, app, anim):
     def poll_stats():
         if state[0] == "idle":
             return
-        elapsed_s = time.time() - macro_wall_start[0]
+        paused_now = (time.time() - pause_wall_start[0]
+                      if state[0] in ("paused", "resume_countdown") else 0.0)
+        elapsed_s = time.time() - macro_wall_start[0] - paused_total_s[0] - paused_now
         remaining = max(0.0, macro_total_ms[0] / 1000 - elapsed_s)
 
         if remaining >= 3600:
@@ -492,6 +497,8 @@ def build_run_tab(tab, app, anim):
     def reset_ui():
         state[0] = "idle"
         pause_event.clear()
+        pause_wall_start[0] = 0.0
+        paused_total_s[0]   = 0.0
         for job in (pulse_job[0], countdown_job[0], poll_job[0]):
             if job:
                 app.after_cancel(job)
@@ -564,9 +571,13 @@ def build_run_tab(tab, app, anim):
             macro_total_ms[0]   = _get_macro_total_ms(selected_file[0])
             macro_wall_start[0] = time.time()
             poll_stats()
+            # Create Controller on the main thread — macOS HIToolbox APIs
+            # (TSMGetInputSourceProperty) require the main thread during init.
+            _controller = kb_module.Controller()
+            _file = selected_file[0]
             threading.Thread(
                 target=lambda: [
-                    macro(selected_file[0], stop_event, stats_dict, pause_event),
+                    macro(_file, stop_event, stats_dict, pause_event, _controller),
                     app.after(0, reset_ui),
                 ],
                 daemon=True,
@@ -582,6 +593,7 @@ def build_run_tab(tab, app, anim):
             btn_run.configure(text=f"Resuming in {n}...", fg_color=color)
             countdown_job[0] = app.after(1000, lambda: do_resume_countdown(n - 1))
         else:
+            paused_total_s[0] += time.time() - pause_wall_start[0]
             state[0] = "running"
             btn_run.configure(text="Pause")
             btn_color[0] = C["blue"]
@@ -593,12 +605,16 @@ def build_run_tab(tab, app, anim):
     def on_action_click():
         s = state[0]
         if s == "idle":
+            if not selected_file[0]:
+                file_label.configure(text="please select a file first", text_color=C["pink"])
+                return
             state[0] = "countdown"
             show_action_and_terminate()
             do_countdown(5)
         elif s == "running":
             # Pause
             state[0] = "paused"
+            pause_wall_start[0] = time.time()
             pause_event.set()
             if pulse_job[0]:
                 app.after_cancel(pulse_job[0])
